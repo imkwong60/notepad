@@ -1,5 +1,5 @@
 /* J.Law Notepad Service Worker */
-const CACHE = 'jl-notepad-v1';
+const CACHE = 'jl-notepad-v2';
 const PRECACHE = [
   './',
   './index.html',
