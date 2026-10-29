@@ -624,6 +624,7 @@
     const SUPABASE_URL = 'https://wanknivxcsrasdkkxmfr.supabase.co';
     const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6IndhbmtuaXZ4Y3NyYXNka2t4bWZyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODczMzE4NjcsImV4cCI6MjEwMjkwNzg2N30.tqsFimERtYCxoh8J-8FlqxByWtX2gNnyaGo08jditrs';
     const STORAGE_KEY = 'notepad_data_v1';
+    const THEME_KEY = 'notepad_theme_v1';
     const DATA_ROW_ID = 'main';
 
     let sbClient = null;
@@ -634,6 +635,8 @@
     let cloudSaveTimer = null;
     let localSaveTimer = null;
     let autoSaveTimer = null;
+    let lastPushedHash = null;
+    let cloudDirty = false;
 
     let appState = {
       notes: [],
@@ -704,22 +707,78 @@
       return sbClient;
     }
 
-    function applyStateObject(obj) {
+        /** 只同步筆記內容；主題不進雲端 */
+    function getCloudPayload() {
+      return {
+        notes: state.notes,
+        folders: state.folders,
+        activeFolderId: state.activeFolderId,
+        // activeNoteId / theme / isWordWrap 不進雲端，避免裝置互相干擾
+      };
+    }
+
+    function hashCloudPayload(payload) {
+      try {
+        return JSON.stringify(payload);
+      } catch (e) {
+        return String(Date.now());
+      }
+    }
+
+    function markCloudDirty() {
+      const h = hashCloudPayload(getCloudPayload());
+      if (lastPushedHash !== null && h === lastPushedHash) {
+        cloudDirty = false;
+        return;
+      }
+      cloudDirty = true;
+    }
+
+    function applyStateObject(obj, opts) {
       if (!obj) return;
-      state.notes = obj.notes || [];
-      state.folders = obj.folders || [];
-      state.activeFolderId = obj.activeFolderId || 'all';
-      state.activeNoteId = obj.activeNoteId || null;
-      state.theme = obj.theme || 'dark';
-      state.isWordWrap = obj.isWordWrap !== undefined ? obj.isWordWrap : true;
+      const options = opts || {};
+      // 雲端資料：永不覆寫本機主題
+      if (obj.notes) state.notes = obj.notes;
+      if (obj.folders) state.folders = obj.folders;
+      if (obj.activeFolderId !== undefined) state.activeFolderId = obj.activeFolderId || 'all';
+      // activeNoteId 僅本機載入時採用；雲端同步時可選保留
+      if (!options.fromCloud && obj.activeNoteId !== undefined) {
+        state.activeNoteId = obj.activeNoteId || null;
+      }
+      if (!options.fromCloud && obj.theme) {
+        // 僅本機存檔可能帶 theme（舊版相容）；正式主題改走 THEME_KEY
+      }
+      if (obj.isWordWrap !== undefined) state.isWordWrap = obj.isWordWrap;
       state.notes.forEach(n => { if (n.folderId === undefined) n.folderId = null; });
     }
 
+    function loadThemeLocal() {
+      try {
+        const t = localStorage.getItem(THEME_KEY);
+        if (t === 'light' || t === 'dark') state.theme = t;
+      } catch (e) {}
+    }
+
+    function saveThemeLocal() {
+      try {
+        localStorage.setItem(THEME_KEY, state.theme === 'light' ? 'light' : 'dark');
+      } catch (e) {}
+    }
+
     function loadLocalState() {
+      loadThemeLocal();
       const saved = localStorage.getItem(STORAGE_KEY);
       if (!saved) return false;
       try {
-        applyStateObject(JSON.parse(saved));
+        const obj = JSON.parse(saved);
+        applyStateObject(obj, { fromCloud: false });
+        // 舊版曾把 theme 寫進主存檔，遷移一次到 THEME_KEY
+        if (obj.theme === 'light' || obj.theme === 'dark') {
+          if (!localStorage.getItem(THEME_KEY)) {
+            state.theme = obj.theme;
+            saveThemeLocal();
+          }
+        }
         return true;
       } catch (e) {
         console.error(e);
@@ -729,7 +788,16 @@
 
     function saveLocalState() {
       try {
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+        // 本機可存 UI 狀態；主題另存
+        const local = {
+          notes: state.notes,
+          folders: state.folders,
+          activeFolderId: state.activeFolderId,
+          activeNoteId: state.activeNoteId,
+          isWordWrap: state.isWordWrap
+        };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(local));
+        saveThemeLocal();
       } catch (e) {
         console.error(e);
       }
@@ -761,15 +829,26 @@
       }
     }
 
-    async function pushToCloud() {
+    async function pushToCloud(force) {
       const client = ensureSupabase();
       if (!client || !isOnline) return false;
       if (isSyncing) return false;
+
+      const payloadData = getCloudPayload();
+      const h = hashCloudPayload(payloadData);
+      if (!force && !cloudDirty && lastPushedHash !== null && h === lastPushedHash) {
+        return false; // 無變更，不打雲端
+      }
+      if (!force && lastPushedHash !== null && h === lastPushedHash) {
+        cloudDirty = false;
+        return false;
+      }
+
       isSyncing = true;
       try {
         const payload = {
           id: DATA_ROW_ID,
-          data: state,
+          data: payloadData,
           updated_at: new Date().toISOString()
         };
         const { error } = await client
@@ -780,6 +859,8 @@
           return false;
         }
         lastCloudUpdatedAt = payload.updated_at;
+        lastPushedHash = h;
+        cloudDirty = false;
         updateSaveStatus('已同步雲端');
         return true;
       } catch (e) {
@@ -791,16 +872,27 @@
     }
 
     function scheduleCloudSave() {
+      if (!cloudDirty) return;
       clearTimeout(cloudSaveTimer);
-      cloudSaveTimer = setTimeout(() => { pushToCloud(); }, 700);
+      // 較長 debounce，減少頻繁上傳
+      cloudSaveTimer = setTimeout(() => { pushToCloud(false); }, 2500);
     }
 
+    /** 有內容變更時呼叫：本機必存，雲端僅在 dirty 時排程 */
     function persistData() {
+      markCloudDirty();
       clearTimeout(localSaveTimer);
-      localSaveTimer = setTimeout(() => saveLocalState(), 1000);
-      if (isOnline) scheduleCloudSave();
-      else updateSaveStatus('本地暫存（離線）');
+      localSaveTimer = setTimeout(() => saveLocalState(), 600);
+      if (isOnline && cloudDirty) {
+        updateSaveStatus('已變更，稍後同步…');
+        scheduleCloudSave();
+      } else if (!isOnline) {
+        updateSaveStatus('本地暫存（離線）');
+      } else {
+        updateSaveStatus('已儲存');
+      }
     }
+
 
     function subscribeRealtime() {
       const client = ensureSupabase();
@@ -829,7 +921,7 @@
             const keepId = state.activeNoteId;
             const keepTitle = noteTitleInput ? noteTitleInput.value : '';
             const keepContent = editor ? editor.innerHTML : '';
-            applyStateObject(row.data);
+            applyStateObject(row.data, { fromCloud: true });
             state.activeNoteId = keepId;
             const active = state.notes.find(n => n.id === keepId);
             if (active) {
@@ -845,17 +937,25 @@
                 lastSaved: new Date().toISOString()
               });
             }
+            lastPushedHash = hashCloudPayload(getCloudPayload());
+            cloudDirty = false;
             saveLocalState();
             if (!noteSearchInput.value.trim()) renderList();
-            updateSaveStatus('已同步雲端');
+            updateSaveStatus('已合併雲端');
             return;
           }
 
-          applyStateObject(row.data);
+          const before = hashCloudPayload(getCloudPayload());
+          applyStateObject(row.data, { fromCloud: true });
+          lastPushedHash = hashCloudPayload(getCloudPayload());
+          cloudDirty = false;
           saveLocalState();
-          renderFromState();
-          updateSaveStatus('已從雲端更新');
-          showToast('已從雲端同步');
+          // 僅在內容真的不同時重繪／提示
+          if (before !== lastPushedHash) {
+            renderFromState();
+            updateSaveStatus('已從雲端更新');
+            showToast('其他裝置有更新');
+          }
         })
         .subscribe();
     }
@@ -863,13 +963,38 @@
     function setupOnlineListeners() {
       window.addEventListener('online', async () => {
         isOnline = true;
-        updateSaveStatus('連線中…');
-        await pushToCloud();
+        if (cloudDirty) {
+          updateSaveStatus('連線中，同步變更…');
+          await pushToCloud(false);
+        } else {
+          updateSaveStatus('已連線');
+        }
         subscribeRealtime();
       });
       window.addEventListener('offline', () => {
         isOnline = false;
         updateSaveStatus('離線（僅本地）');
+      });
+      // 離開頁面／切換 App 時立刻把未同步變更推上雲（有變更才推）
+      document.addEventListener('visibilitychange', () => {
+        if (document.visibilityState === 'hidden') {
+          saveCurrentNoteState();
+          saveLocalState();
+          if (cloudDirty && isOnline) {
+            clearTimeout(cloudSaveTimer);
+            pushToCloud(false);
+          }
+        }
+      });
+      window.addEventListener('pagehide', () => {
+        try {
+          saveCurrentNoteState();
+          saveLocalState();
+          if (cloudDirty && isOnline) {
+            clearTimeout(cloudSaveTimer);
+            pushToCloud(false);
+          }
+        } catch (_) {}
       });
     }
 
@@ -877,7 +1002,8 @@
     function toggleTheme() {
       state.theme = state.theme === 'dark' ? 'light' : 'dark';
       applyTheme(state.theme);
-      persistData();
+      saveThemeLocal();
+      // 主題不觸發雲同步
     }
     function applyTheme(theme) {
       const moon = '<path d="M233.54,142.23a8,8,0,0,0-8-8.18,90,90,0,0,1-74.1-74.1,8,8,0,0,0-8.18-8,106,106,0,1,0,90.28,90.28Z"></path>';
@@ -1862,12 +1988,34 @@
       setupEditorEvents();
       setupVisualViewport();
       registerSW();
+      loadThemeLocal();
 
       if (window.PRELOADED_STATE) {
-        applyStateObject(window.PRELOADED_STATE);
+        applyStateObject(window.PRELOADED_STATE, { fromCloud: false });
+        loadThemeLocal();
         saveLocalState();
         renderFromState();
-        if (isOnline) await pushToCloud();
+        lastPushedHash = hashCloudPayload(getCloudPayload());
+        cloudDirty = false;
+        // 預載狀態不自動狂推雲端，有差異才推
+        if (isOnline) {
+          const remote = await pullFromCloud();
+          if (!remote || !remote.data) {
+            cloudDirty = true;
+            await pushToCloud(true);
+          } else {
+            const remoteHash = hashCloudPayload({
+              notes: remote.data.notes || [],
+              folders: remote.data.folders || [],
+              activeFolderId: remote.data.activeFolderId || 'all'
+            });
+            if (remoteHash !== lastPushedHash) {
+              // 本機預載與雲端不同：以本機為準上傳一次
+              cloudDirty = true;
+              await pushToCloud(true);
+            }
+          }
+        }
         subscribeRealtime();
         return;
       }
@@ -1876,14 +2024,24 @@
       if (isOnline && ensureSupabase()) {
         const remote = await pullFromCloud();
         if (remote && remote.data) {
-          applyStateObject(remote.data);
+          // 先讀本機，若本機有未同步變更可保留策略：以雲端為準載入（開機）
+          // 若本機有 notes 且與雲端 hash 不同且本機較新——簡化：開機以雲端為準，本機編輯後再推
+          loadLocalState();
+          const localHash = hashCloudPayload(getCloudPayload());
+          applyStateObject(remote.data, { fromCloud: true });
+          lastPushedHash = hashCloudPayload(getCloudPayload());
+          cloudDirty = false;
+          // 若本機曾有 dirty 旗標可擴充；此處開機信任雲端內容
           saveLocalState();
           renderFromState();
           updateSaveStatus('已從雲端載入');
         } else {
           loadLocalState();
           renderFromState();
-          await pushToCloud();
+          lastPushedHash = null;
+          cloudDirty = !!(state.notes && state.notes.length);
+          if (cloudDirty) await pushToCloud(true);
+          else updateSaveStatus('就緒');
         }
         subscribeRealtime();
       } else {
